@@ -7,9 +7,9 @@ import argparse
 import json
 import torch
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DistributedSampler, DataLoader
 import torch.multiprocessing as mp
+import wandb
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from env import AttrDict, build_env
@@ -37,6 +37,11 @@ def train(rank, a, h):
         print(generator)
         os.makedirs(a.checkpoint_path, exist_ok=True)
         print("checkpoints directory : ", a.checkpoint_path)
+        wandb.init(
+            project=a.wandb_project,
+            name=a.wandb_run_name,
+            config=dict(h),
+        )
 
     if os.path.isdir(a.checkpoint_path):
         cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
@@ -76,7 +81,8 @@ def train(rank, a, h):
     trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
-                          fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir)
+                          fine_tuning=a.fine_tuning, audio_root_path=a.audio_root_path,
+                          feature_root_path=a.feature_root_path)
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -90,14 +96,12 @@ def train(rank, a, h):
         validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
                               h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
                               fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                              base_mels_path=a.input_mels_dir)
+                              audio_root_path=a.audio_root_path, feature_root_path=a.feature_root_path)
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
                                        batch_size=1,
                                        pin_memory=True,
                                        drop_last=True)
-
-        sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
     generator.train()
     mpd.train()
@@ -178,10 +182,13 @@ def train(rank, a, h):
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
 
-                # Tensorboard summary logging
+                # Weights & Biases summary logging.
                 if steps % a.summary_interval == 0:
-                    sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
-                    sw.add_scalar("training/mel_spec_error", mel_error, steps)
+                    wandb.log({
+                        "training/gen_loss_total": loss_gen_all.item(),
+                        "training/mel_spec_error": mel_error,
+                        "training/disc_loss_total": loss_disc_all.item(),
+                    }, step=steps)
 
                 # Validation
                 if steps % a.validation_interval == 0:  # and steps != 0:
@@ -196,24 +203,46 @@ def train(rank, a, h):
                             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
                                                           h.hop_size, h.win_size,
                                                           h.fmin, h.fmax_for_loss)
-                            val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
+                            # WavLM frame extraction and waveform length can
+                            # differ by a final partial frame.  Compare the
+                            # common mel frame range during validation.
+                            frames = min(y_mel.size(-1), y_g_hat_mel.size(-1))
+                            val_err_tot += F.l1_loss(y_mel[:, :, :frames], y_g_hat_mel[:, :, :frames]).item()
 
                             if j <= 4:
                                 if steps == 0:
-                                    sw.add_audio('gt/y_{}'.format(j), y[0], steps, h.sampling_rate)
-                                    sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(x[0]), steps)
+                                    wandb.log({
+                                        'Ground Truth Audio': wandb.Audio(
+                                            y[0].detach().cpu(), sample_rate=h.sampling_rate,
+                                            caption='gt/y_{}'.format(j)),
+                                        'Ground Truth Spectrogram': wandb.Image(
+                                            plot_spectrogram(y_mel[0].cpu().numpy()),
+                                            caption='gt/y_spec_{}'.format(j)),
+                                    }, step=steps)
 
-                                sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
                                 y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
                                                              h.sampling_rate, h.hop_size, h.win_size,
                                                              h.fmin, h.fmax)
-                                sw.add_figure('generated/y_hat_spec_{}'.format(j),
-                                              plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
+                                wandb.log({
+                                    'Generated Audio': wandb.Audio(
+                                        y_g_hat[0, 0].detach().cpu(), sample_rate=h.sampling_rate,
+                                        caption='generated/y_hat_{}'.format(j)),
+                                    'Generated Spectrogram': wandb.Image(
+                                        plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()),
+                                        caption='generated/y_hat_spec_{}'.format(j)),
+                                }, step=steps)
 
                         val_err = val_err_tot / (j+1)
-                        sw.add_scalar("validation/mel_spec_error", val_err, steps)
+                        wandb.log({"validation/mel_spec_error": val_err}, step=steps)
+                        print('Validation at step {:d}: mel-spec error {:5.4f}'.format(steps, val_err))
 
                     generator.train()
+                    wandb.log({
+                        "memory/max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+                        "memory/max_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
+                    }, step=steps)
+                    torch.cuda.reset_peak_memory_stats()
+                    torch.cuda.reset_accumulated_memory_stats()
 
             steps += 1
 
@@ -223,6 +252,9 @@ def train(rank, a, h):
         if rank == 0:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
+    if rank == 0:
+        wandb.finish()
+
 
 def main():
     print('Initializing Training Process..')
@@ -230,10 +262,14 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--group_name', default=None)
-    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
-    parser.add_argument('--input_mels_dir', default='ft_dataset')
-    parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
-    parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
+    parser.add_argument('--audio_root_path', required=True,
+                        help='Root directory used to resolve audio_path values in the CSV manifests.')
+    parser.add_argument('--feature_root_path', required=True,
+                        help='Root directory used to resolve WavLM feat_path values in the CSV manifests.')
+    parser.add_argument('--input_training_file', required=True,
+                        help='CSV manifest with audio_path and feat_path columns.')
+    parser.add_argument('--input_validation_file', required=True,
+                        help='CSV manifest with audio_path and feat_path columns.')
     parser.add_argument('--checkpoint_path', default='cp_hifigan')
     parser.add_argument('--config', default='')
     parser.add_argument('--training_epochs', default=3100, type=int)
@@ -241,7 +277,9 @@ def main():
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=1000, type=int)
-    parser.add_argument('--fine_tuning', default=False, type=bool)
+    parser.add_argument('--fine_tuning', action='store_true')
+    parser.add_argument('--wandb_project', default='hifigan')
+    parser.add_argument('--wandb_run_name', default=None)
 
     a = parser.parse_args()
 
@@ -250,6 +288,18 @@ def main():
 
     json_config = json.loads(data)
     h = AttrDict(json_config)
+    required_config = ('hubert_dim', 'hifi_dim')
+    missing_config = [key for key in required_config if key not in h]
+    if missing_config:
+        raise ValueError('WavLM training requires config keys: {}'.format(', '.join(missing_config)))
+    upsample_factor = 1
+    for rate in h.upsample_rates:
+        upsample_factor *= rate
+    if upsample_factor != h.hop_size:
+        raise ValueError('prod(upsample_rates) ({}) must equal hop_size ({})'.format(
+            upsample_factor, h.hop_size))
+    if h.segment_size % h.hop_size != 0:
+        raise ValueError('segment_size must be divisible by hop_size for aligned WavLM crops')
     build_env(a.config, 'config.json', a.checkpoint_path)
 
     torch.manual_seed(h.seed)

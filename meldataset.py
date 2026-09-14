@@ -1,18 +1,23 @@
+import csv
 import math
-import os
 import random
+from pathlib import Path
+
+import librosa
 import torch
 import torch.utils.data
 import numpy as np
+import torch.nn.functional as F
 from librosa.util import normalize
-from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
 
 MAX_WAV_VALUE = 32768.0
 
 
 def load_wav(full_path):
-    sampling_rate, data = read(full_path)
+    # LibriSpeech source audio is FLAC, which scipy.io.wavfile cannot read.
+    # Keeping sr=None ensures the waveform stays aligned with WavLM frames.
+    data, sampling_rate = librosa.load(full_path, sr=None, mono=True)
     return data, sampling_rate
 
 
@@ -53,44 +58,60 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
         print('max value is ', torch.max(y))
 
     global mel_basis, hann_window
-    if fmax not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
+    key = str(fmax) + '_' + str(y.device)
+    if key not in mel_basis:
+        mel = librosa_mel_fn(
+            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels,
+            fmin=fmin, fmax=fmax)
+        mel_basis[key] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
     y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
     y = y.squeeze(1)
 
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
+    stft_args = dict(
+        input=y, n_fft=n_fft, hop_length=hop_size, win_length=win_size,
+        window=hann_window[str(y.device)], center=center, pad_mode='reflect',
+        normalized=False, onesided=True)
+    try:
+        # PyTorch >= 1.8: complex STFT output is the supported interface.
+        spec = torch.stft(return_complex=True, **stft_args).abs().clamp_min_(1e-9)
+    except TypeError:
+        # The original project pins PyTorch 1.4, where torch.stft returns a
+        # real/imaginary pair and does not accept return_complex.
+        spec = torch.sqrt(torch.stft(**stft_args).pow(2).sum(-1) + 1e-9)
 
-    spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
-
-    spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
+    spec = torch.matmul(mel_basis[key], spec)
     spec = spectral_normalize_torch(spec)
 
     return spec
 
 
 def get_dataset_filelist(a):
-    with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                          for x in fi.read().split('\n') if len(x) > 0]
-
-    with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                            for x in fi.read().split('\n') if len(x) > 0]
+    training_files = _read_manifest(a.input_training_file)
+    validation_files = _read_manifest(a.input_validation_file)
     return training_files, validation_files
+
+
+def _read_manifest(path):
+    required_columns = {'audio_path', 'feat_path'}
+    with open(path, newline='', encoding='utf-8') as manifest:
+        reader = csv.DictReader(manifest)
+        rows = list(reader)
+        missing = required_columns.difference(reader.fieldnames or ())
+    if missing:
+        raise ValueError(f'CSV manifest {path} is missing columns: {sorted(missing)}')
+    return rows
 
 
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self, training_files, segment_size, n_fft, num_mels,
                  hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
-                 device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None):
+                 device=None, fmax_loss=None, fine_tuning=False, audio_root_path=None, feature_root_path=None):
         self.audio_files = training_files
-        random.seed(1234)
         if shuffle:
-            random.shuffle(self.audio_files)
+            self.audio_files = self.audio_files.copy()
+            random.Random(1234).shuffle(self.audio_files)
         self.segment_size = segment_size
         self.sampling_rate = sampling_rate
         self.split = split
@@ -106,13 +127,17 @@ class MelDataset(torch.utils.data.Dataset):
         self._cache_ref_count = 0
         self.device = device
         self.fine_tuning = fine_tuning
-        self.base_mels_path = base_mels_path
+        if audio_root_path is None or feature_root_path is None:
+            raise ValueError('audio_root_path and feature_root_path are required for WavLM training')
+        self.audio_root_path = Path(audio_root_path)
+        self.feature_root_path = Path(feature_root_path)
 
     def __getitem__(self, index):
-        filename = self.audio_files[index]
+        row = self.audio_files[index]
+        audio_path = self.audio_root_path / row['audio_path']
+        feature_path = self.feature_root_path / row['feat_path']
         if self._cache_ref_count == 0:
-            audio, sampling_rate = load_wav(filename)
-            audio = audio / MAX_WAV_VALUE
+            audio, sampling_rate = load_wav(audio_path)
             if not self.fine_tuning:
                 audio = normalize(audio) * 0.95
             self.cached_wav = audio
@@ -124,45 +149,39 @@ class MelDataset(torch.utils.data.Dataset):
             audio = self.cached_wav
             self._cache_ref_count -= 1
 
-        audio = torch.FloatTensor(audio)
+        audio = torch.as_tensor(audio, dtype=torch.float32)
         audio = audio.unsqueeze(0)
 
-        if not self.fine_tuning:
-            if self.split:
-                if audio.size(1) >= self.segment_size:
-                    max_audio_start = audio.size(1) - self.segment_size
-                    audio_start = random.randint(0, max_audio_start)
-                    audio = audio[:, audio_start:audio_start+self.segment_size]
-                else:
-                    audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
+        features = torch.load(feature_path, map_location='cpu').float()
+        if features.ndim == 3 and features.size(0) == 1:
+            features = features.squeeze(0)
+        if features.ndim != 2:
+            raise ValueError(f'Expected WavLM features shaped (frames, channels), got {tuple(features.shape)} at {feature_path}')
 
-            mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                  self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
-                                  center=False)
+        if self.split:
+            frames_per_seg = math.ceil(self.segment_size / self.hop_size)
+            usable_frames = min(features.size(0), audio.size(1) // self.hop_size)
+            if usable_frames >= frames_per_seg:
+                frame_start = random.randint(0, usable_frames - frames_per_seg)
+                features = features[frame_start:frame_start + frames_per_seg]
+                audio_start = frame_start * self.hop_size
+                audio = audio[:, audio_start:audio_start + self.segment_size]
+            else:
+                features = F.pad(features, (0, 0, 0, frames_per_seg - features.size(0)))
+                audio = audio[:, :self.segment_size]
+                audio = F.pad(audio, (0, self.segment_size - audio.size(1)))
         else:
-            mel = np.load(
-                os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
-            mel = torch.from_numpy(mel)
-
-            if len(mel.shape) < 3:
-                mel = mel.unsqueeze(0)
-
-            if self.split:
-                frames_per_seg = math.ceil(self.segment_size / self.hop_size)
-
-                if audio.size(1) >= self.segment_size:
-                    mel_start = random.randint(0, mel.size(2) - frames_per_seg - 1)
-                    mel = mel[:, :, mel_start:mel_start + frames_per_seg]
-                    audio = audio[:, mel_start * self.hop_size:(mel_start + frames_per_seg) * self.hop_size]
-                else:
-                    mel = torch.nn.functional.pad(mel, (0, frames_per_seg - mel.size(2)), 'constant')
-                    audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
+            # Keep full-utterance validation targets and generated audio on
+            # the same 320-sample WavLM frame grid.
+            usable_frames = min(features.size(0), audio.size(1) // self.hop_size)
+            features = features[:usable_frames]
+            audio = audio[:, :usable_frames * self.hop_size]
 
         mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
                                    self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
                                    center=False)
 
-        return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze())
+        return (features, audio.squeeze(0), row['audio_path'], mel_loss.squeeze())
 
     def __len__(self):
         return len(self.audio_files)
